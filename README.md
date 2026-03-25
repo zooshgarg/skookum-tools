@@ -100,8 +100,3 @@ cp MyMod_P.pak "/path/to/game/Content/Paks/"
 ```
 
 The `_P` suffix on the pak name tells UE4 to treat it as a patch pak that overrides files in the base pak. Make sure the pak version matches the game's pak version (check with `repak info`).
-
-## Known quirks
-- The patcher sets `debug_pos` fields to the parser's character offset in the `.sk` source file, not the original game source positions. This doesn't affect execution, only error reporting line numbers.
-- The checksums in the binary header (`checksum_folders`, `checksum_files`) are copied as-is from the original. The SkookumScript runtime never validates them.
-
