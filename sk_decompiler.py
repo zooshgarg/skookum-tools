@@ -1,9 +1,3 @@
-"""
-SkookumScript Decompiler for The Eternal Cylinder
-Reads Classes.sk-bin and Classes.sk-sym files and produces .sk source files.
-
-Binary format based on open-source SkookumScript for UE 4.24 (version 61).
-"""
 
 import struct
 import os
@@ -1106,7 +1100,18 @@ class SkDecompiler:
         elif tag == 'invoke_closure':
             _, receiver, params, args, ret_args = expr
             recv_str = self.expr_to_code(receiver) if receiver else ""
-            args_str = ", ".join(self.expr_to_code(a) for a in args if a is not None)
+            last_nn = -1
+            for ii in range(len(args) - 1, -1, -1):
+                if args[ii] is not None:
+                    last_nn = ii
+                    break
+            arg_parts = []
+            for ii, a in enumerate(args):
+                if a is not None:
+                    arg_parts.append(self.expr_to_code(a))
+                elif ii < last_nn:
+                    arg_parts.append('nil')
+            args_str = ", ".join(arg_parts)
             if recv_str:
                 return f"{recv_str}({args_str})"
             return f"({args_str})"
@@ -1180,10 +1185,17 @@ class SkDecompiler:
     def _invoke_args_str(self, call: dict) -> str:
         args = call.get('args', [])
         ret_args = call.get('ret_args', [])
+        last_non_none = -1
+        for i in range(len(args) - 1, -1, -1):
+            if args[i] is not None:
+                last_non_none = i
+                break
         parts = []
-        for a in args:
+        for i, a in enumerate(args):
             if a is not None:
                 parts.append(self.expr_to_code(a))
+            elif i < last_non_none:
+                parts.append('nil')
 
         if ret_args:
             ret_parts = []
