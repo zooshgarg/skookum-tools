@@ -1,11 +1,3 @@
-"""
-SkookumScript Source Compiler for The Eternal Cylinder
-Patch-based: loads original .sk-bin via decompiler, parses edited .sk source files,
-patches the AST, and writes modified .sk-bin + .sk-sym.
-
-Usage:
-  python sk_compiler.py <original.sk-bin> <original.sk-sym> <mod_dir> [--output <out.sk-bin> <out.sk-sym>]
-"""
 
 import struct
 import os
@@ -585,6 +577,12 @@ class SkParser:
         self.next_data_idx = 0
         self.temp_vars: List[Tuple[str, int]] = []
         self._local_var_types: Dict[str, str] = {}
+        self._local_var_class_refs: Dict[str, 'ClassRef'] = {}
+        self._outer_locals: Dict[str, int] = {}
+        self._outer_local_types: Dict[str, str] = {}
+        self._outer_local_class_refs: Dict[str, 'ClassRef'] = {}
+        self._closure_captures: List[Tuple[str, int, int]] = []
+        self._in_class_method: bool = False
 
         self._method_db: Dict[Tuple[str, str], Tuple[int, Optional[ClassRef]]] = {}
         self._vtable_i: Dict[str, Dict[str, int]] = {}
@@ -592,9 +590,6 @@ class SkParser:
         self._build_vtables()
 
     def _build_vtables(self):
-        """Simulate the runtime's build_vtables_recurse() to compute correct
-        vtable indices for every method in every class. Also populates
-        _method_db with return type info for type inference."""
         for cls in self.decomp.class_list:
             for routine_list in (cls.instance_methods, cls.class_methods, cls.coroutines):
                 for routine in routine_list:
@@ -607,7 +602,6 @@ class SkParser:
             self._build_vtables_recurse(root)
 
     def _build_vtables_recurse(self, cls):
-        """Build vtable for cls, then recurse into subclasses."""
         if cls.superclass:
             super_vt_i = dict(self._vtable_i.get(cls.superclass.name, {}))
             super_vt_c = dict(self._vtable_c.get(cls.superclass.name, {}))
@@ -684,6 +678,15 @@ class SkParser:
             receiver_class = getattr(receiver_class, 'display', str(receiver_class))
         if scope and not isinstance(scope, str):
             scope = getattr(scope, 'display', str(scope))
+        if receiver_class in ('ThisClass_', 'ItemClass_'):
+            receiver_class = self.current_class.name if self.current_class else receiver_class
+        if receiver_class and receiver_class.startswith('<') and receiver_class.endswith('>'):
+            receiver_class = receiver_class[1:-1]
+        if receiver_class and '|' in receiver_class:
+            parts = receiver_class.split('|')
+            receiver_class = parts[0].strip()
+        if receiver_class and '{' in receiver_class:
+            receiver_class = receiver_class[:receiver_class.index('{')]
         lookup_class = receiver_class or scope
         if lookup_class:
             vt_i = self._vtable_i.get(lookup_class)
@@ -705,12 +708,27 @@ class SkParser:
         return 0xFFFF
 
     def _infer_return_type(self, receiver_class: str, method_name: str) -> Optional[str]:
-        cls = self.decomp.classes.get(receiver_class)
+        rc = receiver_class
+        if rc in ('ThisClass_', 'ItemClass_'):
+            rc = self.current_class.name if self.current_class else rc
+        if rc and rc.startswith('<') and rc.endswith('>'):
+            rc = rc[1:-1]
+        if rc and '{' in rc:
+            rc = rc[:rc.index('{')]
+        cls = self.decomp.classes.get(rc)
         while cls:
             entry = self._method_db.get((cls.name, method_name))
             if entry and entry[1] is not None:
                 rt = entry[1]
-                return rt.display if isinstance(rt, ClassRef) else str(rt)
+                rt_str = rt.display if isinstance(rt, ClassRef) else str(rt)
+                if rt_str in ('ThisClass_', 'ItemClass_') and receiver_class:
+                    base_rc = receiver_class
+                    if base_rc.startswith('<') and base_rc.endswith('>'):
+                        base_rc = base_rc[1:-1]
+                    if '{' in base_rc:
+                        base_rc = base_rc[:base_rc.index('{')]
+                    return base_rc
+                return rt_str
             cls = cls.superclass
         return None
 
@@ -738,6 +756,8 @@ class SkParser:
                 return expr[2]
             return {'Boolean': 'Boolean', 'Integer': 'Integer', 'Real': 'Real',
                     'String': 'String', 'Symbol': 'Symbol', 'nil': 'None'}.get(lit_type)
+        if tag == 'literal_list':
+            return 'List'
         if tag == 'instantiate' and len(expr) > 2:
             return expr[2]
         if tag in ('invoke', 'invoke_sync', 'invoke_race') and len(expr) >= 3:
@@ -746,6 +766,20 @@ class SkParser:
                 recv_type = self._infer_expr_type(expr[1])
                 if recv_type:
                     return self._infer_return_type(recv_type, call.get('name', ''))
+        if tag in ('invoke_closure',) and len(expr) >= 3:
+            params = expr[2]
+            if isinstance(params, SkParams) and params.result_type:
+                rt = params.result_type
+                return rt.display if isinstance(rt, ClassRef) else str(rt)
+        if tag == 'conditional' and len(expr) > 1:
+            clauses = expr[1]
+            for test, body in clauses:
+                if body:
+                    return self._infer_expr_type(body)
+        if tag == 'code' and len(expr) >= 4:
+            stmts = expr[3]
+            if stmts:
+                return self._infer_expr_type(stmts[-1])
         if tag == 'cast' and len(expr) > 1:
             ct = expr[1]
             return ct.display if isinstance(ct, ClassRef) else None
@@ -780,6 +814,23 @@ class SkParser:
                     if dm_name == member_name or dm_name == prefixed_name:
                         return dm_type.display if isinstance(dm_type, ClassRef) else str(dm_type)
                 cls = cls.superclass
+        if tag == 'raw_member_invoke' and len(expr) > 5:
+            owner_class = expr[3] if len(expr) > 3 else None
+            member_idx = expr[4] if len(expr) > 4 else None
+            call = expr[6] if len(expr) > 6 else (expr[5] if len(expr) > 5 else None)
+            if isinstance(call, dict) and isinstance(owner_class, str):
+                owner_cls = self.decomp.classes.get(owner_class)
+                raw_type = None
+                if owner_cls and isinstance(member_idx, int) and member_idx < len(owner_cls.raw_data_members):
+                    _, _, raw_type_ref, _ = owner_cls.raw_data_members[member_idx]
+                    raw_type = raw_type_ref.display if isinstance(raw_type_ref, ClassRef) else str(raw_type_ref)
+                if raw_type:
+                    rt = self._infer_return_type(raw_type, call.get('name', ''))
+                    if rt:
+                        return rt
+                    return raw_type
+        if tag == 'raw_member_assignment':
+            return None
         if tag == 'code' and len(expr) > 3:
             stmts = expr[3]
             if stmts:
@@ -794,6 +845,7 @@ class SkParser:
                     if dm_name == raw_name:
                         return (i, cls.name, self.sym_id(cls.name))
                 cls = cls.superclass
+            return None
 
         for cls in self.decomp.class_list:
             for i, (dm_name, dm_id, dm_type, bname) in enumerate(cls.raw_data_members):
@@ -905,7 +957,7 @@ class SkParser:
 
     def parse_name(self) -> str:
         start = self.pos
-        if self.at_end() or not (self.peek().isalpha() or self.peek() == '_'):
+        if self.at_end() or not (self.peek().isalnum() or self.peek() == '_'):
             self.error("Expected identifier")
         while not self.at_end() and (self.peek().isalnum() or self.peek() == '_'):
             self.pos += 1
@@ -1006,9 +1058,16 @@ class SkParser:
         return name, self.sym_id(name)
 
 
-    def parse_class_name(self) -> str:
+    def parse_class_name(self, allow_invokable: bool = False) -> str:
         if self.peek() == '<':
             return self._parse_angle_type()
+
+        if allow_invokable:
+            if self.peek() == '(':
+                return self._parse_invokable_class_type('')
+            if self.peek() in ('_', '+') and self.pos + 1 < len(self.source) and self.source[self.pos + 1] == '(':
+                prefix = self.advance()
+                return self._parse_invokable_class_type(prefix)
 
         name = self.parse_name()
 
@@ -1019,6 +1078,20 @@ class SkParser:
             return f"{name}{{{item}}}"
 
         return name
+
+    def _parse_invokable_class_type(self, prefix: str) -> str:
+        self.expect('(')
+        depth = 1
+        start = self.pos
+        while not self.at_end() and depth > 0:
+            ch = self.source[self.pos]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            self.pos += 1
+        content = self.source[start:self.pos - 1]
+        return f"{prefix}({content})"
 
     def _parse_angle_type(self) -> str:
         self.expect('<')
@@ -1031,8 +1104,8 @@ class SkParser:
             return f"<{types[0]}>"
         return "<" + "|".join(types) + ">"
 
-    def parse_class_ref_typed(self) -> ClassRef:
-        type_str = self.parse_class_name()
+    def parse_class_ref_typed(self, allow_invokable: bool = False) -> ClassRef:
+        type_str = self.parse_class_name(allow_invokable=allow_invokable)
         return self.resolve_class_ref_typed(type_str)
 
 
@@ -1072,7 +1145,7 @@ class SkParser:
         if ch == '^':
             return self.parse_closure()
 
-        if ch == '!' and self.pos + 1 < len(self.source) and (self.source[self.pos + 1].isalpha() or self.source[self.pos + 1] == '_'):
+        if ch == '!' and self.pos + 1 < len(self.source) and (self.source[self.pos + 1].isalpha() or self.source[self.pos + 1] == '_' or self.source[self.pos + 1] == '@'):
             return self.parse_bind()
 
         if ch == '@':
@@ -1158,12 +1231,32 @@ class SkParser:
             if next_after_at in ("'", '?', '#'):
 
                 return self._parse_object_id(name)
-            if next_after_at.isalpha() or next_after_at == '_':
+            if next_after_at.isalpha() or next_after_at == '_' or next_after_at == '!':
                 return self._parse_scoped_invoke(name)
 
         if name in self.local_vars:
             data_idx = self.local_vars[name]
             name_id = self.sym_id(name)
+            return self._make_expr(EXPR_IDENT_LOCAL, ('ident_local', name, name_id, data_idx))
+
+        if self._outer_locals and name in self._outer_locals:
+            name_id = self.sym_id(name)
+            outer_idx = self._outer_locals[name]
+            existing = None
+            for i, (cn, cid, cidx) in enumerate(self._closure_captures):
+                if cn == name:
+                    existing = i
+                    break
+            if existing is None:
+                self._closure_captures.append((name, name_id, outer_idx))
+                data_idx = 0xDEAD
+                self.local_vars[name] = data_idx
+                if name in self._outer_local_types:
+                    self._local_var_types[name] = self._outer_local_types[name]
+                if name in self._outer_local_class_refs:
+                    self._local_var_class_refs[name] = self._outer_local_class_refs[name]
+            else:
+                data_idx = self.local_vars[name]
             return self._make_expr(EXPR_IDENT_LOCAL, ('ident_local', name, name_id, data_idx))
 
         if name in self.decomp.classes and not self._could_be_method_call(name):
@@ -1193,6 +1286,26 @@ class SkParser:
         ch = self.peek()
         return ch == '(' or ch == '.'
 
+    def _is_class_method(self, method_name: str, class_name: str = None) -> bool:
+        cls_name = class_name or (self.current_class.name if self.current_class else None)
+        if not cls_name:
+            return False
+        if cls_name in ('ThisClass_', 'ItemClass_'):
+            cls_name = self.current_class.name if self.current_class else cls_name
+        if cls_name.startswith('<') and cls_name.endswith('>'):
+            cls_name = cls_name[1:-1]
+        if '{' in cls_name:
+            cls_name = cls_name[:cls_name.index('{')]
+        cls = self.decomp.classes.get(cls_name)
+        while cls:
+            for r in cls.class_methods:
+                if r.name == method_name:
+                    return True
+            for r in cls.instance_methods:
+                if r.name == method_name:
+                    return False
+            cls = cls.superclass
+        return False
 
     def _parse_postfix(self, expr: dict) -> dict:
         while True:
@@ -1211,6 +1324,13 @@ class SkParser:
                     continue
 
                 method_name = self.parse_name()
+
+                inner = expr.get('expr') if isinstance(expr, dict) else None
+                if (inner and isinstance(inner, tuple) and inner[0] == 'ident_raw_member'
+                        and method_name not in ('negated', 'not')):
+                    expr = self._parse_raw_member_invoke(expr, method_name)
+                    continue
+
                 expr = self._parse_invoke_on_receiver(expr, method_name, scope=None)
                 continue
 
@@ -1225,7 +1345,8 @@ class SkParser:
                 self.pos += 2
                 conv_class = self.parse_class_name()
                 conv_class_id = self.sym_id(conv_class)
-                vtable_idx = self._lookup_vtable('', conv_class)
+                recv_type = self._infer_expr_type(expr)
+                vtable_idx = self._lookup_vtable('', conv_class, receiver_class=recv_type)
                 expr = self._make_expr(EXPR_CONVERSION, ('conversion', conv_class_id, conv_class, vtable_idx, expr))
                 continue
 
@@ -1279,10 +1400,107 @@ class SkParser:
                     expr = self._parse_invoke_on_receiver(expr, method_name, scope=None, invoke_tag='invoke_sync', expr_type=EXPR_INVOKE_SYNC)
                 continue
 
+            if ch == '(':
+                args, ret_args = self._parse_args()
+                closure_params = self._get_closure_params(expr)
+                is_coroutine = self._closure_is_coroutine_call(expr)
+                expr_type = EXPR_INVOKE_CLOSURE_COROUTINE if is_coroutine else EXPR_INVOKE_CLOSURE_METHOD
+                expr = self._make_expr(expr_type,
+                    ('invoke_closure', expr, closure_params, args, ret_args))
+                continue
+
             break
 
         return expr
 
+
+    def _get_closure_params(self, closure_expr: dict) -> SkParams:
+        inner = closure_expr.get('expr') if isinstance(closure_expr, dict) else None
+        if inner and isinstance(inner, tuple):
+            if inner[0] == 'ident_local':
+                var_name = inner[1]
+                cref = self._local_var_class_refs.get(var_name)
+                if cref and hasattr(cref, 'ctype') and cref.ctype == CLASS_TYPE_INVOKABLE_CLASS:
+                    ic = self.decomp.invokable_classes[cref.raw_id]
+                    if ic:
+                        return self._resolve_invoke_closure_params(ic['params'])
+                type_name = self._local_var_types.get(var_name)
+                if type_name and (type_name.startswith('(') or type_name.startswith('_(') or type_name.startswith('+(')):
+                    for ic in self.decomp.invokable_classes:
+                        if ic and ic['display'] == type_name:
+                            return self._resolve_invoke_closure_params(ic['params'])
+            elif inner[0] in ('ident_member', 'ident_raw_member', 'ident_class_member'):
+                member_name = inner[1]
+                cls = self.current_class
+                while cls:
+                    for dm_name, dm_id, dm_type in cls.data_members:
+                        if dm_name == member_name:
+                            if hasattr(dm_type, 'ctype') and dm_type.ctype == CLASS_TYPE_INVOKABLE_CLASS:
+                                ic = self.decomp.invokable_classes[dm_type.raw_id]
+                                if ic:
+                                    return self._resolve_invoke_closure_params(ic['params'])
+                            dm_display = dm_type.display if hasattr(dm_type, 'display') else str(dm_type)
+                            if dm_display.startswith('(') or dm_display.startswith('_('):
+                                for ic in self.decomp.invokable_classes:
+                                    if ic and ic['display'] == dm_display:
+                                        return self._resolve_invoke_closure_params(ic['params'])
+                    for dm_name, dm_id, dm_type, *_ in cls.class_data_members:
+                        if dm_name == member_name:
+                            if hasattr(dm_type, 'ctype') and dm_type.ctype == CLASS_TYPE_INVOKABLE_CLASS:
+                                ic = self.decomp.invokable_classes[dm_type.raw_id]
+                                if ic:
+                                    return self._resolve_invoke_closure_params(ic['params'])
+                    cls = cls.superclass
+        return SkParams()
+
+    def _resolve_invoke_closure_params(self, ic_params: SkParams) -> SkParams:
+        import copy
+        resolved = copy.deepcopy(ic_params)
+        cls_name = self.current_class.name if self.current_class else 'Object'
+        for p in resolved.params:
+            if hasattr(p.class_type, 'display'):
+                if p.class_type.display == 'ThisClass_':
+                    p.class_type = self.class_ref_for_name(cls_name)
+                elif p.class_type.display == 'ItemClass_':
+                    p.class_type = self.class_ref_for_name('Object')
+        if hasattr(resolved.result_type, 'display'):
+            if resolved.result_type.display == 'ThisClass_':
+                resolved.result_type = self.class_ref_for_name(cls_name)
+            elif resolved.result_type.display == 'ItemClass_':
+                resolved.result_type = self.class_ref_for_name('Object')
+        return resolved
+
+    def _fix_closure_arg_params(self, call: dict, recv_class: str = None):
+        method_name = call.get('name', '')
+        routine = self._find_routine(method_name, recv_class)
+        if not routine or not routine.params:
+            return
+        args = call.get('args', [])
+        for i, arg in enumerate(args):
+            if arg is None:
+                continue
+            if not isinstance(arg, dict):
+                continue
+            inner = arg.get('expr')
+            if not isinstance(inner, tuple) or inner[0] != 'closure':
+                continue
+            if i < len(routine.params.params):
+                param = routine.params.params[i]
+                if hasattr(param.class_type, 'ctype') and param.class_type.ctype == CLASS_TYPE_INVOKABLE_CLASS:
+                    ic = self.decomp.invokable_classes[param.class_type.raw_id]
+                    if ic:
+                        closure_params = inner[4]
+                        ic_params = ic['params']
+                        closure_params.result_type = ic_params.result_type
+
+    def _closure_is_coroutine_call(self, closure_expr: dict) -> bool:
+        inner = closure_expr.get('expr') if isinstance(closure_expr, dict) else None
+        if inner and isinstance(inner, tuple) and inner[0] == 'ident_local':
+            var_name = inner[1]
+            type_name = self._local_var_types.get(var_name)
+            if type_name and (type_name.startswith('_(') or type_name.startswith('+(')):
+                return True
+        return False
 
     def _parse_member_ident(self, owner=None) -> dict:
         self.expect('@')
@@ -1297,26 +1515,26 @@ class SkParser:
             name = self.parse_name()
             name_id = self.sym_id(name)
 
-            raw_name = f"@{name}"
+            if extra_at < 2:
+                raw_name = f"@{name}"
 
-            search_cls = None
-            if owner:
-                owner_type = self._infer_expr_type(owner)
-                if owner_type:
-                    search_cls = self.decomp.classes.get(owner_type)
-            else:
-                search_cls = self.current_class
-            raw_match = self._find_raw_member(raw_name, search_class=search_cls)
+                search_cls = None
+                if owner:
+                    owner_type = self._infer_expr_type(owner)
+                    if owner_type:
+                        search_cls = self.decomp.classes.get(owner_type)
+                else:
+                    search_cls = self.current_class
+                raw_match = self._find_raw_member(raw_name, search_class=search_cls)
 
-            if raw_match:
-                data_idx, owner_class_name, owner_class_name_id = raw_match
-                raw_name_id = self.sym_id(raw_name)
-                return self._make_expr(EXPR_IDENT_RAW_MEMBER,
-                    ('ident_raw_member', raw_name, raw_name_id, data_idx, owner, owner_class_name_id, owner_class_name))
+                if raw_match:
+                    data_idx, owner_class_name, owner_class_name_id = raw_match
+                    raw_name_id = self.sym_id(raw_name)
+                    return self._make_expr(EXPR_IDENT_RAW_MEMBER,
+                        ('ident_raw_member', raw_name, raw_name_id, data_idx, owner, owner_class_name_id, owner_class_name))
 
             class_dm_name = f"@@{name}"
-            class_dm_name_id = self.sym_id(class_dm_name)
-
+            class_dm_found = False
             data_idx = 0
             owner_class = self.current_class.name if self.current_class else 'Object'
             cls = self.current_class
@@ -1325,14 +1543,31 @@ class SkParser:
                     if dm_name == class_dm_name or dm_name == name:
                         data_idx = i
                         owner_class = cls.name
+                        class_dm_found = True
                         break
                 else:
                     cls = cls.superclass
                     continue
                 break
 
-            owner_class_id = self.sym_id(owner_class)
+            if class_dm_found:
+                class_dm_name_id = self.sym_id(class_dm_name)
+                owner_class_id = self.sym_id(owner_class)
+                return self._make_expr(EXPR_IDENT_CLASS_MEMBER,
+                    ('ident_class_member', class_dm_name, class_dm_name_id, data_idx, owner_class_id, owner_class))
 
+            at_name = f"@{name}"
+            cls = self.current_class
+            while cls:
+                for i, (dm_name, dm_id, dm_type) in enumerate(cls.data_members):
+                    if dm_name == at_name:
+                        at_name_id = self.sym_id(at_name)
+                        return self._make_expr(EXPR_IDENT_MEMBER,
+                            ('ident_member', at_name, at_name_id, i, owner))
+                cls = cls.superclass if hasattr(cls, 'superclass') else None
+
+            class_dm_name_id = self.sym_id(class_dm_name)
+            owner_class_id = self.sym_id(owner_class)
             return self._make_expr(EXPR_IDENT_CLASS_MEMBER,
                 ('ident_class_member', class_dm_name, class_dm_name_id, data_idx, owner_class_id, owner_class))
         else:
@@ -1362,6 +1597,85 @@ class SkParser:
                 return self._make_expr(EXPR_IDENT_MEMBER,
                     ('ident_member', name, name_id, data_idx, owner))
 
+
+    def _parse_raw_member_invoke(self, raw_member_expr: dict, method_name: str) -> dict:
+        inner = raw_member_expr['expr']
+
+        chain = []
+        while inner and isinstance(inner, tuple) and inner[0] == 'ident_raw_member':
+            _, name, name_id, data_idx, owner_expr, owner_class_id, owner_class = inner
+            chain.append((owner_class_id, owner_class, data_idx))
+            if owner_expr and isinstance(owner_expr, dict):
+                inner_owner = owner_expr.get('expr')
+                if inner_owner and isinstance(inner_owner, tuple) and inner_owner[0] == 'ident_raw_member':
+                    inner = inner_owner
+                    continue
+            real_owner = owner_expr
+            break
+
+        mc_id, mc, mi = chain[0]
+        cascade = [(c_id, c_name, c_idx) for c_id, c_name, c_idx in chain[1:]]
+
+        raw_member_type = self._infer_raw_member_type(mc, mi)
+
+        args = []
+        ret_args = []
+        if not self.at_end() and self.peek() == '(':
+            args, ret_args = self._parse_args()
+
+        call = self._make_call_dict(method_name, args, ret_args, receiver_class=raw_member_type)
+
+        BOOL_INVOKE_MAP = {
+            'and': INVOKE_METHOD_BOOL_AND,
+            'or': INVOKE_METHOD_BOOL_OR,
+            'nand': INVOKE_METHOD_BOOL_NAND,
+            'nor': INVOKE_METHOD_BOOL_NOR,
+            'assert': INVOKE_METHOD_ASSERT,
+            'assert_no_leak': INVOKE_METHOD_ASSERT_NO_LEAK,
+        }
+        if method_name.startswith('_'):
+            call['invoke_type'] = INVOKE_COROUTINE
+        elif method_name in BOOL_INVOKE_MAP:
+            call['invoke_type'] = BOOL_INVOKE_MAP[method_name]
+        else:
+            call['invoke_type'] = INVOKE_METHOD_ON_INSTANCE
+
+        return self._make_expr(EXPR_RAW_MEMBER_INVOKE,
+            ('raw_member_invoke', real_owner, mc_id, mc, mi, cascade, call))
+
+    def _infer_raw_member_type(self, owner_class: str, data_idx: int) -> Optional[str]:
+        cls = self.decomp.classes.get(owner_class)
+        if cls and data_idx < len(cls.raw_data_members):
+            _, _, type_ref, _ = cls.raw_data_members[data_idx]
+            name = str(type_ref) if type_ref else None
+            if name and name.startswith('<') and name.endswith('>'):
+                name = name[1:-1]
+            return name
+        return None
+
+    def _find_routine(self, name: str, class_name: str = None) -> Optional[SkRoutine]:
+        cls_name = class_name or (self.current_class.name if self.current_class else None)
+        if not cls_name:
+            return None
+        if cls_name in ('ThisClass_', 'ItemClass_'):
+            cls_name = self.current_class.name if self.current_class else cls_name
+        if cls_name.startswith('<') and cls_name.endswith('>'):
+            cls_name = cls_name[1:-1]
+        if '{' in cls_name:
+            cls_name = cls_name[:cls_name.index('{')]
+        cls = self.decomp.classes.get(cls_name)
+        while cls:
+            for r in cls.instance_methods:
+                if r.name == name:
+                    return r
+            for r in cls.class_methods:
+                if r.name == name:
+                    return r
+            for r in cls.coroutines:
+                if r.name == name:
+                    return r
+            cls = cls.superclass
+        return None
 
     def _make_call_dict(self, name: str, args: list = None, ret_args: list = None,
                         scope: str = None, receiver_class: str = None) -> dict:
@@ -1406,7 +1720,11 @@ class SkParser:
 
             arg = self.parse_expression()
             if arg is not None:
-                current.append(arg)
+                inner = arg.get('expr') if isinstance(arg, dict) else None
+                if isinstance(inner, tuple) and len(inner) >= 2 and inner[0] == 'literal' and inner[1] == 'nil':
+                    current.append(None)
+                else:
+                    current.append(arg)
 
         self.expect(')')
         return args, ret_args
@@ -1422,16 +1740,33 @@ class SkParser:
             self.current_class.name if self.current_class else None)
         call = self._make_call_dict(method_name, args, ret_args, scope, receiver_class=recv_class)
 
+        self._fix_closure_arg_params(call, recv_class)
+
         is_class_receiver = False
         if receiver and isinstance(receiver, dict):
             inner = receiver.get('expr')
             if isinstance(inner, tuple) and len(inner) >= 2 and inner[0] == 'literal' and inner[1] == 'Class':
                 is_class_receiver = True
 
+        BOOL_INVOKE_MAP = {
+            'and': INVOKE_METHOD_BOOL_AND,
+            'or': INVOKE_METHOD_BOOL_OR,
+            'nand': INVOKE_METHOD_BOOL_NAND,
+            'nor': INVOKE_METHOD_BOOL_NOR,
+            'assert': INVOKE_METHOD_ASSERT,
+            'assert_no_leak': INVOKE_METHOD_ASSERT_NO_LEAK,
+        }
         if method_name.startswith('_'):
             call['invoke_type'] = INVOKE_COROUTINE
+        elif method_name in BOOL_INVOKE_MAP:
+            call['invoke_type'] = BOOL_INVOKE_MAP[method_name]
         elif is_class_receiver:
             call['invoke_type'] = INVOKE_METHOD_ON_CLASS
+        elif recv_class and self._is_class_method(method_name, recv_class):
+            if recv_class.startswith('<') and recv_class.endswith('>'):
+                call['invoke_type'] = INVOKE_METHOD_ON_CLASS
+            else:
+                call['invoke_type'] = INVOKE_METHOD_ON_INSTANCE_CLASS
         else:
             call['invoke_type'] = INVOKE_METHOD_ON_INSTANCE
 
@@ -1470,12 +1805,24 @@ class SkParser:
 
         if name.startswith('_'):
             call['invoke_type'] = INVOKE_COROUTINE
+        elif self._is_class_method(name, recv_class):
+            if self._in_class_method:
+                call['invoke_type'] = INVOKE_METHOD_ON_CLASS
+            else:
+                call['invoke_type'] = INVOKE_METHOD_ON_INSTANCE_CLASS
 
         return self._make_expr(EXPR_INVOKE, ('invoke', None, call))
 
     def _parse_scoped_invoke(self, scope_name: str) -> dict:
         self.expect('@')
-        method_name = self.parse_name()
+        prefix = ''
+        if not self.at_end() and self.peek() == '!':
+            prefix = '!'
+            self.pos += 1
+        if prefix and (self.at_end() or self.peek() == '('):
+            method_name = prefix
+        else:
+            method_name = prefix + self.parse_name()
         if not self.at_end() and self.peek() == '(':
             return self._parse_invoke_on_implicit(method_name, scope=scope_name)
         recv_class = self.current_class.name if self.current_class else None
@@ -1486,7 +1833,11 @@ class SkParser:
         self.expect('!')
 
         ctor_name = '!'
-        if not self.at_end() and self.peek() != '(' and self.peek().isalpha():
+        if not self.at_end() and self.peek() == '!':
+            self.pos += 1
+            ctor_name_part = self.parse_name()
+            ctor_name = f"!{ctor_name_part}"
+        elif not self.at_end() and self.peek() != '(' and self.peek().isalpha():
             ctor_name_part = self.parse_name()
             ctor_name = f"!{ctor_name_part}"
 
@@ -1497,6 +1848,7 @@ class SkParser:
 
         class_id = self.sym_id(class_name)
         ctor_call = self._make_call_dict(ctor_name, args, ret_args, receiver_class=class_name)
+        ctor_call.pop('invoke_type', None)
         return self._make_expr(EXPR_INSTANTIATE, ('instantiate', class_id, class_name, ctor_call))
 
     def _parse_object_id(self, class_name: str) -> dict:
@@ -1523,6 +1875,7 @@ class SkParser:
 
         saved_temps = self.temp_vars
         self.temp_vars = []
+        temp_start = self.next_data_idx
 
         stmts = []
         while not self.at_end() and self.peek() != ']':
@@ -1538,8 +1891,117 @@ class SkParser:
 
         block_temps = self.temp_vars
         self.temp_vars = saved_temps
-        start_idx = self.next_data_idx - len(block_temps)
-        return self._make_expr(EXPR_CODE, ('code', start_idx, block_temps, stmts))
+        start_idx = temp_start
+        result = self._make_expr(EXPR_CODE, ('code', start_idx, block_temps, stmts))
+        self._redistribute_temps(result)
+        return result
+
+    @staticmethod
+    def _collect_vars_at_level(stmts):
+        names = set()
+        for stmt in stmts:
+            SkParser._collect_vars_from_expr(stmt, names)
+        return names
+
+    @staticmethod
+    def _collect_vars_from_expr(node, names):
+        if node is None:
+            return
+        if isinstance(node, dict):
+            inner = node.get('expr')
+            if isinstance(inner, tuple):
+                if inner[0] == 'code':
+                    return
+                if inner[0] == 'ident_local':
+                    names.add(inner[1])
+                for item in inner:
+                    if isinstance(item, (dict, list)):
+                        SkParser._collect_vars_from_expr(item, names)
+            elif isinstance(inner, list):
+                for item in inner:
+                    SkParser._collect_vars_from_expr(item, names)
+        elif isinstance(node, list):
+            for item in node:
+                SkParser._collect_vars_from_expr(item, names)
+        elif isinstance(node, tuple):
+            if node[0] == 'code':
+                return
+            if node[0] == 'ident_local':
+                names.add(node[1])
+            for item in node:
+                if isinstance(item, (dict, list, tuple)):
+                    SkParser._collect_vars_from_expr(item, names)
+
+    @staticmethod
+    def _collect_child_code_blocks(stmts):
+        blocks = []
+        for stmt in stmts:
+            SkParser._find_child_code_blocks(stmt, blocks)
+        return blocks
+
+    @staticmethod
+    def _find_child_code_blocks(node, blocks):
+        if node is None:
+            return
+        if isinstance(node, dict):
+            inner = node.get('expr')
+            if isinstance(inner, tuple):
+                if inner[0] == 'code':
+                    blocks.append(node)
+                    return
+                for item in inner:
+                    if isinstance(item, (dict, list)):
+                        SkParser._find_child_code_blocks(item, blocks)
+            elif isinstance(inner, list):
+                for item in inner:
+                    SkParser._find_child_code_blocks(item, blocks)
+        elif isinstance(node, list):
+            for item in node:
+                SkParser._find_child_code_blocks(item, blocks)
+        elif isinstance(node, tuple):
+            if node[0] == 'code':
+                return
+            for item in node:
+                if isinstance(item, (dict, list, tuple)):
+                    SkParser._find_child_code_blocks(item, blocks)
+
+    def _redistribute_temps(self, code_block_dict):
+        expr = code_block_dict.get('expr')
+        if not isinstance(expr, tuple) or expr[0] != 'code':
+            return
+
+        _, start_idx, block_temps, stmts = expr
+
+        child_blocks = self._collect_child_code_blocks(stmts)
+        for child in child_blocks:
+            self._redistribute_temps(child)
+
+        level_vars = self._collect_vars_at_level(stmts)
+
+        promoted = []
+        for child in child_blocks:
+            child_expr = child['expr']
+            if not isinstance(child_expr, tuple) or child_expr[0] != 'code':
+                continue
+            c_start, c_temps, c_stmts = child_expr[1], child_expr[2], child_expr[3]
+            remaining_temps = []
+            for temp in c_temps:
+                temp_name = temp[0]
+                if temp_name in level_vars:
+                    promoted.append(temp)
+                else:
+                    remaining_temps.append(temp)
+            if len(remaining_temps) != len(c_temps):
+                new_start = c_start + (len(c_temps) - len(remaining_temps))
+                child['expr'] = ('code', new_start, remaining_temps, c_stmts)
+                self._update_nested_data_sizes(child)
+
+        if promoted:
+            new_temps = promoted + list(block_temps)
+            code_block_dict['expr'] = ('code', start_idx, new_temps, stmts)
+
+    def _update_nested_data_sizes(self, code_block_dict):
+        pass
 
     def parse_literal_list(self) -> dict:
         self.expect('{')
@@ -1565,6 +2027,28 @@ class SkParser:
         self.expect('^')
         self.skip_ws()
 
+        is_coroutine = False
+
+        saved_locals = self.local_vars.copy()
+        saved_next_idx = self.next_data_idx
+        saved_temps = self.temp_vars
+        saved_local_types = self._local_var_types.copy()
+        saved_outer_locals = self._outer_locals
+        saved_outer_local_types = self._outer_local_types
+        saved_outer_local_class_refs = self._outer_local_class_refs
+        saved_local_class_refs = self._local_var_class_refs.copy()
+        saved_captured = self._closure_captures
+
+        self._outer_locals = saved_locals.copy()
+        self._outer_local_types = saved_local_types.copy()
+        self._outer_local_class_refs = saved_local_class_refs.copy()
+        self._closure_captures = []
+        self.local_vars = {}
+        self.next_data_idx = 0
+        self.temp_vars = []
+        self._local_var_types = {}
+        self._local_var_class_refs = {}
+
         params = SkParams()
         params.result_type = self.class_ref_for_name('Object')
         if not self.at_end() and self.peek() == '(':
@@ -1572,30 +2056,149 @@ class SkParser:
             if str(params.result_type) == 'None':
                 params.result_type = self.class_ref_for_name('Object')
 
-        saved_locals = self.local_vars.copy()
-        saved_next_idx = self.next_data_idx
-        saved_temps = self.temp_vars
-        saved_local_types = self._local_var_types.copy()
-        self.local_vars = {}
-        self.next_data_idx = 0
-        self.temp_vars = []
-        self._local_var_types = {}
-
         self.skip_ws()
         body = self.parse_expression()
 
-        closure_data_size = self.next_data_idx
+        if body and isinstance(body, dict):
+            body_inner = body.get('expr')
+            if isinstance(body_inner, tuple) and len(body_inner) >= 2:
+                if body_inner[0] == 'literal' and body_inner[1] == 'nil':
+                    params.result_type = self.class_ref_for_name('None')
+
+        is_coroutine = self._closure_is_coroutine(body)
+
+        captured = sorted(self._closure_captures, key=lambda c: c[1])
+        num_captures = len(captured)
+
+        if num_captures > 0:
+            capture_names = {cname for cname, _, _ in captured}
+            self._shift_ast_data_indices(body, num_captures, skip_names=capture_names)
+            capture_idx_map = {}
+            for ci, (cname, cname_id, couter_idx) in enumerate(captured):
+                capture_idx_map[cname] = ci
+            self._fix_capture_indices(body, capture_idx_map)
+            for p in params.params:
+                if p.name in self.local_vars:
+                    self.local_vars[p.name] += num_captures
+            for ci, (cname, cname_id, couter_idx) in enumerate(captured):
+                self.local_vars[cname] = ci
+
+        closure_data_size = self.next_data_idx + num_captures
 
         self.local_vars = saved_locals
         self.next_data_idx = saved_next_idx
         self.temp_vars = saved_temps
         self._local_var_types = saved_local_types
+        self._local_var_class_refs = saved_local_class_refs
+        self._outer_locals = saved_outer_locals
+        self._outer_local_types = saved_outer_local_types
+        self._outer_local_class_refs = saved_outer_local_class_refs
+        self._closure_captures = saved_captured
 
-        return self._make_expr(EXPR_CLOSURE_METHOD,
-            ('closure', True, None, [], params, closure_data_size, 0, body))
+        expr_type = EXPR_CLOSURE_COROUTINE if is_coroutine else EXPR_CLOSURE_METHOD
+        return self._make_expr(expr_type,
+            ('closure', not is_coroutine, None, captured, params, closure_data_size, 0, body))
+
+    def _shift_ast_data_indices(self, node, offset: int, skip_names: set = None):
+        if node is None:
+            return
+        if isinstance(node, dict):
+            inner = node.get('expr')
+            if inner and isinstance(inner, tuple):
+                if inner[0] == 'ident_local' and len(inner) >= 4:
+                    if skip_names and inner[1] in skip_names:
+                        return
+                    node['expr'] = (inner[0], inner[1], inner[2], inner[3] + offset)
+                    return
+                elif inner[0] == 'code' and len(inner) >= 4:
+                    node['expr'] = (inner[0], inner[1] + offset, inner[2], inner[3])
+                    for stmt in inner[3]:
+                        self._shift_ast_data_indices(stmt, offset, skip_names)
+                    return
+                elif inner[0] in ('closure',):
+                    return
+                elif inner[0] == 'concurrent_branch' and len(inner) >= 6:
+                    old_captures = inner[1]
+                    new_captures = []
+                    for cname, cname_id, couter_idx in old_captures:
+                        if skip_names and cname in skip_names:
+                            new_captures.append((cname, cname_id, couter_idx))
+                        else:
+                            new_captures.append((cname, cname_id, couter_idx + offset))
+                    node['expr'] = (inner[0], new_captures, inner[2], inner[3], inner[4], inner[5])
+                    return
+            for v in node.values():
+                self._shift_ast_data_indices(v, offset, skip_names)
+        elif isinstance(node, list):
+            for item in node:
+                self._shift_ast_data_indices(item, offset, skip_names)
+        elif isinstance(node, tuple):
+            for item in node:
+                self._shift_ast_data_indices(item, offset, skip_names)
+
+    def _fix_capture_indices(self, node, capture_map: dict):
+        if node is None:
+            return
+        if isinstance(node, dict):
+            inner = node.get('expr')
+            if inner and isinstance(inner, tuple):
+                if inner[0] == 'ident_local' and len(inner) >= 4 and inner[1] in capture_map:
+                    node['expr'] = (inner[0], inner[1], inner[2], capture_map[inner[1]])
+                    return
+                elif inner[0] in ('closure',):
+                    return
+                elif inner[0] == 'concurrent_branch' and len(inner) >= 6:
+                    old_captures = inner[1]
+                    new_captures = []
+                    for cname, cname_id, couter_idx in old_captures:
+                        if cname in capture_map:
+                            new_captures.append((cname, cname_id, capture_map[cname]))
+                        else:
+                            new_captures.append((cname, cname_id, couter_idx))
+                    node['expr'] = (inner[0], new_captures, inner[2], inner[3], inner[4], inner[5])
+                    return
+            for v in node.values():
+                self._fix_capture_indices(v, capture_map)
+        elif isinstance(node, list):
+            for item in node:
+                self._fix_capture_indices(item, capture_map)
+        elif isinstance(node, tuple):
+            for item in node:
+                self._fix_capture_indices(item, capture_map)
+
+    def _closure_is_coroutine(self, expr) -> bool:
+        if expr is None:
+            return False
+        if isinstance(expr, dict):
+            inner = expr.get('expr')
+            if inner:
+                return self._closure_is_coroutine(inner)
+        if isinstance(expr, tuple):
+            if expr[0] in ('invoke', 'invoke_sync', 'invoke_race'):
+                call = expr[2] if len(expr) > 2 else None
+                if isinstance(call, dict) and call.get('invoke_type') == INVOKE_COROUTINE:
+                    return True
+            for item in expr:
+                if self._closure_is_coroutine(item):
+                    return True
+        if isinstance(expr, list):
+            for item in expr:
+                if self._closure_is_coroutine(item):
+                    return True
+        return False
 
     def parse_bind(self) -> dict:
         self.expect('!')
+
+        if not self.at_end() and self.peek() == '@':
+            ident_expr = self._parse_member_ident(owner=None)
+            self.skip_ws_inline()
+            if self.match(':'):
+                self.skip_ws()
+                value = self.parse_expression()
+                return self._make_expr(EXPR_BIND, ('bind', ident_expr, value))
+            return self._make_expr(EXPR_BIND, ('bind', ident_expr, None))
+
         name = self.parse_name()
         name_id = self.sym_id(name)
 
@@ -1604,8 +2207,6 @@ class SkParser:
             self.next_data_idx += 1
             self.temp_vars.append((name, name_id))
         data_idx = self.local_vars[name]
-
-        is_member = name.startswith('@')
 
         ident_expr = self._make_expr(EXPR_IDENT_LOCAL, ('ident_local', name, name_id, data_idx))
 
@@ -1627,26 +2228,46 @@ class SkParser:
 
         test = self.parse_expression()
         self.skip_ws()
+
+        branch_start_idx = self.next_data_idx
+        branch_start_locals = self.local_vars.copy()
+        branch_start_temps = list(self.temp_vars)
+        branch_start_types = self._local_var_types.copy()
+        max_idx_seen = branch_start_idx
+
         body = self.parse_expression()
         clauses.append((test, body))
+        max_idx_seen = max(max_idx_seen, self.next_data_idx)
 
         while True:
             self.skip_ws()
             if self.check_keyword('elseif'):
                 self.pos += 6
                 self.skip_ws()
+                self.next_data_idx = branch_start_idx
+                self.local_vars = branch_start_locals.copy()
+                self.temp_vars = list(branch_start_temps)
+                self._local_var_types = branch_start_types.copy()
                 test = self.parse_expression()
                 self.skip_ws()
                 body = self.parse_expression()
                 clauses.append((test, body))
+                max_idx_seen = max(max_idx_seen, self.next_data_idx)
             elif self.check_keyword('else'):
                 self.pos += 4
                 self.skip_ws()
+                self.next_data_idx = branch_start_idx
+                self.local_vars = branch_start_locals.copy()
+                self.temp_vars = list(branch_start_temps)
+                self._local_var_types = branch_start_types.copy()
                 body = self.parse_expression()
                 clauses.append((None, body))
+                max_idx_seen = max(max_idx_seen, self.next_data_idx)
                 break
             else:
                 break
+
+        self.next_data_idx = max_idx_seen
 
         return self._make_expr(EXPR_CONDITIONAL, ('conditional', clauses))
 
@@ -1656,6 +2277,12 @@ class SkParser:
         compare = self.parse_expression()
         self.skip_ws()
 
+        branch_start_idx = self.next_data_idx
+        branch_start_locals = self.local_vars.copy()
+        branch_start_temps = list(self.temp_vars)
+        branch_start_types = self._local_var_types.copy()
+        max_idx_seen = branch_start_idx
+
         clauses = []
         while True:
             self.skip_ws()
@@ -1664,16 +2291,30 @@ class SkParser:
             if self.check_keyword('else'):
                 self.pos += 4
                 self.skip_ws()
+                self.next_data_idx = branch_start_idx
+                self.local_vars = branch_start_locals.copy()
+                self.temp_vars = list(branch_start_temps)
+                self._local_var_types = branch_start_types.copy()
                 body = self.parse_expression()
                 clauses.append((None, body))
+                max_idx_seen = max(max_idx_seen, self.next_data_idx)
                 break
             if self.peek() == ']':
                 break
 
             test = self.parse_expression()
             self.skip_ws()
+            saved_idx = self.next_data_idx
+            max_idx_seen = max(max_idx_seen, saved_idx)
+            self.next_data_idx = branch_start_idx
+            self.local_vars = branch_start_locals.copy()
+            self.temp_vars = list(branch_start_temps)
+            self._local_var_types = branch_start_types.copy()
             body = self.parse_expression()
             clauses.append((test, body))
+            max_idx_seen = max(max_idx_seen, self.next_data_idx)
+
+        self.next_data_idx = max_idx_seen
 
         return self._make_expr(EXPR_CASE, ('case', compare, clauses))
 
@@ -1683,9 +2324,15 @@ class SkParser:
 
         loop_name_id = 0xFFFFFFFF
         if not self.at_end() and self.peek() != '[' and self.peek().isalpha():
-            name = self.parse_name()
-            loop_name_id = self.sym_id(name)
-            self.skip_ws()
+            if not (self.check_keyword('if') or self.check_keyword('exit') or
+                    self.check_keyword('loop') or self.check_keyword('case') or
+                    self.check_keyword('sync') or self.check_keyword('race') or
+                    self.check_keyword('branch') or self.check_keyword('nil') or
+                    self.check_keyword('this') or self.check_keyword('true') or
+                    self.check_keyword('false')):
+                name = self.parse_name()
+                loop_name_id = self.sym_id(name)
+                self.skip_ws()
 
         body = self.parse_expression()
         return self._make_expr(EXPR_LOOP, ('loop', loop_name_id, body))
@@ -1714,9 +2361,82 @@ class SkParser:
     def parse_branch(self) -> dict:
         self.match_keyword('branch')
         self.skip_ws()
+
+        saved_locals = self.local_vars.copy()
+        saved_next_idx = self.next_data_idx
+        saved_temps = self.temp_vars
+        saved_local_types = self._local_var_types.copy()
+        saved_outer_locals = self._outer_locals
+        saved_outer_local_types = self._outer_local_types
+        saved_outer_local_class_refs = self._outer_local_class_refs
+        saved_local_class_refs = self._local_var_class_refs.copy()
+        saved_captured = self._closure_captures
+
+        combined_locals = {}
+        if saved_outer_locals:
+            combined_locals.update(saved_outer_locals)
+        combined_locals.update(saved_locals)
+        combined_types = {}
+        if saved_outer_local_types:
+            combined_types.update(saved_outer_local_types)
+        combined_types.update(saved_local_types)
+        combined_class_refs = {}
+        if saved_outer_local_class_refs:
+            combined_class_refs.update(saved_outer_local_class_refs)
+        combined_class_refs.update(saved_local_class_refs)
+        self._outer_locals = combined_locals
+        self._outer_local_types = combined_types
+        self._outer_local_class_refs = combined_class_refs
+        self._closure_captures = []
+        self.local_vars = {}
+        self.next_data_idx = 0
+        self.temp_vars = []
+        self._local_var_types = {}
+        self._local_var_class_refs = {}
+
         body = self.parse_expression()
+
+        captured = sorted(self._closure_captures, key=lambda c: c[1])
+        num_captures = len(captured)
+
+        if num_captures > 0:
+            capture_names = {cname for cname, _, _ in captured}
+            self._shift_ast_data_indices(body, num_captures, skip_names=capture_names)
+            capture_idx_map = {}
+            for ci, (cname, cname_id, couter_idx) in enumerate(captured):
+                capture_idx_map[cname] = ci
+            self._fix_capture_indices(body, capture_idx_map)
+            for ci, (cname, cname_id, couter_idx) in enumerate(captured):
+                self.local_vars[cname] = ci
+
+        branch_data_size = self.next_data_idx + num_captures
+
+        self.local_vars = saved_locals
+        self.next_data_idx = saved_next_idx
+        self.temp_vars = saved_temps
+        self._local_var_types = saved_local_types
+        self._local_var_class_refs = saved_local_class_refs
+        self._outer_locals = saved_outer_locals
+        self._outer_local_types = saved_outer_local_types
+        self._outer_local_class_refs = saved_outer_local_class_refs
+        self._closure_captures = saved_captured
+
+        for cname, cname_id, couter_idx in captured:
+            if cname not in saved_locals and saved_outer_locals and cname in saved_outer_locals:
+                existing = None
+                for ec in self._closure_captures:
+                    if ec[0] == cname:
+                        existing = ec
+                        break
+                if existing is None:
+                    outer_idx = saved_outer_locals[cname]
+                    self._closure_captures.append((cname, cname_id, outer_idx))
+                    self.local_vars[cname] = 0xDEAD
+
+        params = SkParams()
+        params.result_type = self.class_ref_for_name('Object')
         return self._make_expr(EXPR_CONCURRENT_BRANCH,
-            ('concurrent_branch', [], SkParams(), 0, 0, body))
+            ('concurrent_branch', captured, params, branch_data_size, 0, body))
 
     def parse_divert(self) -> dict:
         self.match_keyword('divert')
@@ -1772,6 +2492,12 @@ class SkParser:
                 name = self.parse_name()
                 name_id = self.sym_id(name)
                 params.return_params.append((name, name_id, ctype))
+                if name not in self.local_vars:
+                    self.local_vars[name] = self.next_data_idx
+                    self.next_data_idx += 1
+                type_name = ctype.display if hasattr(ctype, 'display') else str(ctype) if ctype else None
+                if type_name:
+                    self._local_var_types[name] = type_name
             else:
                 param = self._parse_single_param()
                 params.params.append(param)
@@ -1795,19 +2521,37 @@ class SkParser:
             self.skip_ws()
             name = self.parse_name()
             name_id = self.sym_id(name)
+            if name not in self.local_vars:
+                self.local_vars[name] = self.next_data_idx
+                self.next_data_idx += 1
+            self._local_var_types[name] = 'List'
             param = SkParam(kind=PARAM_GROUP, name=name, name_id=name_id)
             param.group_classes = classes
             param.type_info = len(classes)
             return param
 
-        ctype = self.parse_class_ref_typed()
+        ctype = self.parse_class_ref_typed(allow_invokable=True)
         self.skip_ws()
         name = self.parse_name()
         name_id = self.sym_id(name)
 
+        if hasattr(ctype, 'ctype') and ctype.ctype == CLASS_TYPE_INVOKABLE_CLASS:
+            orig = getattr(self, '_original_routine', None)
+            if orig and orig.params:
+                for op in orig.params.params:
+                    if op.name == name and hasattr(op.class_type, 'ctype') and op.class_type.ctype == CLASS_TYPE_INVOKABLE_CLASS:
+                        ctype = op.class_type
+                        break
+
         if name not in self.local_vars:
             self.local_vars[name] = self.next_data_idx
             self.next_data_idx += 1
+
+        type_name = ctype.display if hasattr(ctype, 'display') else str(ctype) if ctype else None
+        if type_name:
+            self._local_var_types[name] = type_name
+            if hasattr(ctype, 'ctype') and ctype.ctype == CLASS_TYPE_INVOKABLE_CLASS:
+                self._local_var_class_refs[name] = ctype
 
         self.skip_ws_inline()
         if self.peek() == ':' and (self.pos + 1 >= len(self.source) or self.source[self.pos + 1] != '='):
@@ -1832,9 +2576,16 @@ class SkParser:
         self.pos = 0
         self.local_vars = {}
         self._local_var_types = {}
+        self._local_var_class_refs = {}
+        self._outer_locals = {}
+        self._outer_local_types = {}
+        self._outer_local_class_refs = {}
+        self._closure_captures = []
         self.next_data_idx = 0
         self.temp_vars = []
         self.current_class = self.decomp.classes.get(class_name)
+        self._in_class_method = is_class_method
+        self._original_routine = self._find_routine(routine_name, class_name)
 
         self.skip_ws()
         while not self.at_end() and self.source[self.pos:self.pos+2] == '//':
