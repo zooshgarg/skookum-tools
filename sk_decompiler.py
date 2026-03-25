@@ -1134,14 +1134,16 @@ class SkDecompiler:
         elif tag == 'concurrent_sync':
             _, exprs = expr
             pad = " " * indent
-            inner = "\n".join(f"{pad}  {self.expr_to_code(e, indent + self.indent_size)}" for e in exprs if e)
-            return f"sync\n{inner}"
+            inner_pad = " " * (indent + self.indent_size)
+            inner = "\n".join(f"{inner_pad}{self.expr_to_code(e, indent + self.indent_size)}" for e in exprs if e)
+            return f"sync\n{pad}[\n{inner}\n{pad}]"
 
         elif tag == 'concurrent_race':
             _, exprs = expr
             pad = " " * indent
-            inner = "\n".join(f"{pad}  {self.expr_to_code(e, indent + self.indent_size)}" for e in exprs if e)
-            return f"race\n{inner}"
+            inner_pad = " " * (indent + self.indent_size)
+            inner = "\n".join(f"{inner_pad}{self.expr_to_code(e, indent + self.indent_size)}" for e in exprs if e)
+            return f"race\n{pad}[\n{inner}\n{pad}]"
 
         elif tag == 'concurrent_branch':
             _, captured, params, inv_data_size, ann_flags, body = expr
@@ -1329,11 +1331,14 @@ class SkDecompiler:
     def _write_data_file(self, class_dir: str, cls: SkClass):
         lines = []
         for name, name_id, ctype in cls.data_members:
-            lines.append(f"&{ctype} @{name}")
+            bare = name.lstrip('@')
+            lines.append(f"&{ctype} @{bare}")
         for name, name_id, ctype in cls.class_data_members:
-            lines.append(f"&{ctype} @@{name}")
+            bare = name.lstrip('@')
+            lines.append(f"&{ctype} @@{bare}")
         for name, name_id, ctype, bname in cls.raw_data_members:
-            lines.append(f"&raw {ctype} @{name}  // bind: {bname}")
+            bare = name.lstrip('@')
+            lines.append(f"&raw {ctype} @{bare}  // bind: {bname}")
 
         if lines:
             filepath = os.path.join(class_dir, "!Data.sk")
