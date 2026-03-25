@@ -1,6 +1,6 @@
 # skookum-tools
 
-Decompiler and compiler for SkookumScript compiled binaries (`.sk-bin` + `.sk-sym`). Built for **The Eternal Cylinder** but should work with any game using SkookumScript binary format version 61.
+Decompiler and patcher for SkookumScript compiled binaries (`.sk-bin` + `.sk-sym`). Built for **The Eternal Cylinder** but should work with any game using SkookumScript binary format version 61.
 
 Tested on:
 - The Eternal Cylinder (UE 4.24, Day One build rev 2625)
@@ -13,7 +13,7 @@ If it doesn't, feel free to make an Issue or a PR.
 
 **`sk_decompiler.py`** -- Reads compiled `.sk-bin` + `.sk-sym` and produces readable `.sk` source files. Parses the entire binary with 0 bytes remaining.
 
-**`sk_compiler.py`** -- Patch-based compiler for modding. Loads an original `.sk-bin`, applies your edited `.sk` files on top, and writes a modified binary you can repack into the game.
+**`sk_patcher.py`** -- Patch-based patcher for modding. Loads an original `.sk-bin`, applies your edited `.sk` files on top, and writes a modified binary you can repack into the game. Round-trip verified: all 1,217 script files (Steam build) compile back to byte-identical AST output.
 
 ## How SkookumScript binaries work
 
@@ -35,13 +35,13 @@ Output goes into two folders:
 
 Each method becomes its own `.sk` file, organized by class hierarchy.
 
-### Compile (mod)
+### Patch (mod)
 
 ```bash
-python sk_compiler.py <original.sk-bin> <original.sk-sym> <mod_dir> [--output <out.sk-bin> <out.sk-sym>]
+python sk_patcher.py <original.sk-bin> <original.sk-sym> <mod_dir> [--output <out.sk-bin> <out.sk-sym>]
 ```
 
-The compiler is patch-based. It loads the original binary, then looks in `mod_dir` for any `.sk` files you've changed. Only include files you've actually edited. Everything else stays as-is from the original.
+The patcher loads the original binary, then looks in `mod_dir` for any `.sk` files you've changed. Only include files you've actually edited. Everything else stays as-is from the original.
 
 `mod_dir` should mirror the decompiler's output structure:
 
@@ -67,20 +67,6 @@ Characters unsafe on Windows are escaped in filenames: `?` becomes `-Q`, `!` bec
 
 Python 3.8+. No external dependencies.
 
-## Binary format reference
-
-Version 61, little-endian throughout. See the source code for full details, but the high-level structure is:
-
-```
-Header        -- magic (0xDEC0CB), version, checksums, project info
-Class tree    -- recursive class hierarchy with flags and annotations
-Compound types -- typed classes, invokable classes, class unions
-Class members -- for each class: data members, methods, coroutines
-                 each method body is a recursive AST of 35 expression types
-```
-
-The `.sk-sym` format is simpler: a count followed by (CRC32 id, length-prefixed ASCII string) pairs.
-
 ## Modding (UE4 games)
 
 The full pipeline for modding a UE4 game's SkookumScript:
@@ -88,7 +74,7 @@ The full pipeline for modding a UE4 game's SkookumScript:
 1. Extract `Classes.sk-bin` and `Classes.sk-sym` from the game's `.pak` file (use [repak](https://github.com/trumank/repak) or similar)
 2. Decompile to get readable `.sk` source
 3. Copy and edit the files you want to change into a mod directory
-4. Compile your mod against the original binary
+4. Patch your mod into the original binary
 5. Pack the modified `.sk-bin` + `.sk-sym` into a patch pak and drop it into the game's `Paks/` folder
 
 ```bash
@@ -101,10 +87,10 @@ python sk_decompiler.py Classes.sk-bin Classes.sk-sym ./decompiled
 # 3. Edit (copy only files you want to change)
 mkdir -p my_mod/Object/Actor/Pawn/SomeClass/
 cp decompiled/script/Object/Actor/Pawn/SomeClass/_some_coroutine.sk my_mod/Object/Actor/Pawn/SomeClass/
-# ... edit the files ...
+# ... edit the file ...
 
-# 4. Compile
-python sk_compiler.py Classes.sk-bin Classes.sk-sym my_mod/ --output patched/Classes.sk-bin patched/Classes.sk-sym
+# 4. Patch
+python sk_patcher.py Classes.sk-bin Classes.sk-sym my_mod/ --output patched/Classes.sk-bin patched/Classes.sk-sym
 
 # 5. Pack (UE4 patch pak)
 mkdir -p MyMod_P/GameName/Content/SkookumScript/
@@ -116,6 +102,6 @@ cp MyMod_P.pak "/path/to/game/Content/Paks/"
 The `_P` suffix on the pak name tells UE4 to treat it as a patch pak that overrides files in the base pak. Make sure the pak version matches the game's pak version (check with `repak info`).
 
 ## Known quirks
-- The compiler sets `debug_pos` fields to the parser's character offset in the `.sk` source file, not the original game source positions. This doesn't affect execution, only error reporting line numbers.
+- The patcher sets `debug_pos` fields to the parser's character offset in the `.sk` source file, not the original game source positions. This doesn't affect execution, only error reporting line numbers.
 - The checksums in the binary header (`checksum_folders`, `checksum_files`) are copied as-is from the original. The SkookumScript runtime never validates them.
 
